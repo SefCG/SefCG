@@ -1,6 +1,14 @@
 # SefCG
 
-SefCG is now a Flutter application targeting Android and iOS.
+SefCG is a Flutter application for checking trading card prices, identifying exact card printings, and tracking a digital collection portfolio.
+
+## Current MVP
+
+- Pokemon and Riftbound game selection
+- Manual search by card name, collector number, or set
+- Exact card detail pages with set, rarity, variant, price source, and freshness
+- OCR-first scanner workflow with candidate fallback
+- Local collection portfolio view with acquisition cost, estimated value, and unrealised gain/loss
 
 ## Requirements
 
