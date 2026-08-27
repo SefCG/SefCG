@@ -1,7 +1,11 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 void main() {
-  runApp(const SefCgApp());
+  runApp(SefCgApp(repository: RealCardPriceRepository()));
 }
 
 enum TcgGame {
@@ -12,6 +16,16 @@ enum TcgGame {
 
   final String code;
   final String label;
+}
+
+class ApiConfig {
+  const ApiConfig({
+    this.pokemonTcgApiKey = const String.fromEnvironment('POKEMON_TCG_API_KEY'),
+    this.tcgApiKey = const String.fromEnvironment('TCG_API_KEY'),
+  });
+
+  final String pokemonTcgApiKey;
+  final String tcgApiKey;
 }
 
 class PriceInfo {
@@ -38,7 +52,7 @@ class TradingCard {
     required this.rarity,
     required this.variant,
     required this.price,
-    required this.palette,
+    this.imageUrl,
   });
 
   final String id;
@@ -49,7 +63,7 @@ class TradingCard {
   final String rarity;
   final String variant;
   final PriceInfo price;
-  final List<Color> palette;
+  final String? imageUrl;
 }
 
 class CollectionEntry {
@@ -79,123 +93,485 @@ class CandidateMatch {
   final int score;
 }
 
-const sampleCards = <TradingCard>[
-  TradingCard(
-    id: 'pkm-057-191',
-    game: TcgGame.pokemon,
-    name: 'Pikachu ex',
-    setName: 'Surging Sparks',
-    collectorNumber: '057/191',
-    rarity: 'Double Rare',
-    variant: 'Holofoil',
-    price: PriceInfo(
-      marketPrice: 12.40,
-      currency: 'SGD',
-      source: 'Backend price cache',
-      freshness: 'Updated 2h ago',
-    ),
-    palette: [Color(0xFFFFD447), Color(0xFF2F6FDB)],
-  ),
-  TradingCard(
-    id: 'pkm-025-165',
-    game: TcgGame.pokemon,
-    name: 'Pikachu',
-    setName: 'Pokemon 151',
-    collectorNumber: '025/165',
-    rarity: 'Common',
-    variant: 'Reverse Holo',
-    price: PriceInfo(
-      marketPrice: 3.10,
-      currency: 'SGD',
-      source: 'Backend price cache',
-      freshness: 'Updated today',
-    ),
-    palette: [Color(0xFFFFE26B), Color(0xFF4B5563)],
-  ),
-  TradingCard(
-    id: 'pkm-006-165',
-    game: TcgGame.pokemon,
-    name: 'Charizard ex',
-    setName: 'Pokemon 151',
-    collectorNumber: '006/165',
-    rarity: 'Special Illustration Rare',
-    variant: 'Holofoil',
-    price: PriceInfo(
-      marketPrice: 165.00,
-      currency: 'SGD',
-      source: 'Backend price cache',
-      freshness: 'Updated 45m ago',
-    ),
-    palette: [Color(0xFFE85D04), Color(0xFF7C2D12)],
-  ),
-  TradingCard(
-    id: 'pkm-199-197',
-    game: TcgGame.pokemon,
-    name: 'Charizard ex',
-    setName: 'Obsidian Flames',
-    collectorNumber: '199/197',
-    rarity: 'Special Illustration Rare',
-    variant: 'Holofoil',
-    price: PriceInfo(
-      marketPrice: 84.50,
-      currency: 'SGD',
-      source: 'Backend price cache',
-      freshness: 'Updated yesterday',
-    ),
-    palette: [Color(0xFFEF4444), Color(0xFF111827)],
-  ),
-  TradingCard(
-    id: 'rift-yasuo-024',
-    game: TcgGame.riftbound,
-    name: 'Yasuo, Unforgiven',
-    setName: 'Origins',
-    collectorNumber: '024/298',
-    rarity: 'Champion',
-    variant: 'Standard',
-    price: PriceInfo(
-      marketPrice: 18.80,
-      currency: 'SGD',
-      source: 'Backend price cache',
-      freshness: 'Updated 3h ago',
-    ),
-    palette: [Color(0xFF14B8A6), Color(0xFF0F172A)],
-  ),
-  TradingCard(
-    id: 'rift-jinx-041',
-    game: TcgGame.riftbound,
-    name: 'Jinx, Loose Cannon',
-    setName: 'Origins',
-    collectorNumber: '041/298',
-    rarity: 'Champion',
-    variant: 'Foil',
-    price: PriceInfo(
-      marketPrice: 22.60,
-      currency: 'SGD',
-      source: 'Backend price cache',
-      freshness: 'Updated today',
-    ),
-    palette: [Color(0xFFEC4899), Color(0xFF2563EB)],
-  ),
-  TradingCard(
-    id: 'rift-ahri-112',
-    game: TcgGame.riftbound,
-    name: 'Ahri, Nine-Tailed Fox',
-    setName: 'Spirit Bonds',
-    collectorNumber: '112/240',
-    rarity: 'Epic',
-    variant: 'Standard',
-    price: PriceInfo(
-      marketPrice: 9.75,
-      currency: 'SGD',
-      source: 'Backend price cache',
-      freshness: 'Updated 6h ago',
-    ),
-    palette: [Color(0xFFA855F7), Color(0xFF0891B2)],
-  ),
-];
+abstract class CardPriceRepository {
+  Future<List<TradingCard>> searchCards(TcgGame game, String query);
+
+  Future<List<CandidateMatch>> identifyCard(TcgGame game, String evidence);
+}
+
+class CardApiException implements Exception {
+  const CardApiException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+typedef JsonGetter =
+    Future<Map<String, Object?>> Function(
+      Uri uri, {
+      Map<String, String> headers,
+    });
+
+class RealCardPriceRepository implements CardPriceRepository {
+  RealCardPriceRepository({
+    ApiConfig config = const ApiConfig(),
+    PokemonTcgClient? pokemonClient,
+    TcgApiClient? tcgApiClient,
+  }) : _pokemonClient = pokemonClient ?? PokemonTcgClient(config),
+       _tcgApiClient = tcgApiClient ?? TcgApiClient(config);
+
+  final PokemonTcgClient _pokemonClient;
+  final TcgApiClient _tcgApiClient;
+
+  @override
+  Future<List<TradingCard>> searchCards(TcgGame game, String query) {
+    final trimmedQuery = query.trim();
+    if (trimmedQuery.isEmpty) {
+      return Future.value(const []);
+    }
+
+    return switch (game) {
+      TcgGame.pokemon => _pokemonClient.searchCards(trimmedQuery),
+      TcgGame.riftbound => _tcgApiClient.searchCards(game, trimmedQuery),
+    };
+  }
+
+  @override
+  Future<List<CandidateMatch>> identifyCard(
+    TcgGame game,
+    String evidence,
+  ) async {
+    final query = _queryFromEvidence(evidence);
+    final cards = await searchCards(game, query);
+    final lowerEvidence = evidence.toLowerCase();
+    final matches =
+        cards
+            .map(
+              (card) => CandidateMatch(
+                card: card,
+                score: _score(card, lowerEvidence),
+              ),
+            )
+            .where((match) => match.score > 0)
+            .toList()
+          ..sort((a, b) => b.score.compareTo(a.score));
+    return matches.take(5).toList();
+  }
+
+  String _queryFromEvidence(String evidence) {
+    final collectorNumber = RegExp(r'\b\d{1,4}/\d{1,4}\b').firstMatch(evidence);
+    if (collectorNumber != null) {
+      return evidence;
+    }
+
+    final words = evidence
+        .split(RegExp(r'[^A-Za-z0-9]+'))
+        .where((word) => word.length > 2)
+        .take(5);
+    return words.join(' ');
+  }
+
+  int _score(TradingCard card, String evidence) {
+    var score = 0;
+    if (evidence.contains(card.collectorNumber.toLowerCase())) {
+      score += 70;
+    }
+    final printedNumber = card.collectorNumber.split('/').first;
+    if (printedNumber.isNotEmpty &&
+        evidence.contains(printedNumber.toLowerCase())) {
+      score += 28;
+    }
+    if (evidence.contains(card.setName.toLowerCase())) {
+      score += 20;
+    }
+    for (final token in card.name.toLowerCase().split(RegExp(r'[\s,.-]+'))) {
+      if (token.length > 2 && evidence.contains(token)) {
+        score += 12;
+      }
+    }
+    if (evidence.contains(card.rarity.toLowerCase())) {
+      score += 8;
+    }
+    return score.clamp(0, 100);
+  }
+}
+
+class PokemonTcgClient {
+  PokemonTcgClient(this._config, {JsonGetter getJson = _getJson})
+    : _getJsonClient = getJson;
+
+  final ApiConfig _config;
+  final JsonGetter _getJsonClient;
+
+  Future<List<TradingCard>> searchCards(String query) async {
+    CardApiException? lastError;
+    var hasSuccessfulRequest = false;
+    final seenCardIds = <String>{};
+    final matches = <TradingCard>[];
+    for (final pokemonQuery in _pokemonQueries(query)) {
+      try {
+        final cards = await _searchAllPokemonPages(pokemonQuery);
+        hasSuccessfulRequest = true;
+        final matchingCards = cards.where(
+          (card) => _cardMatchesQuery(card, query),
+        );
+        for (final card in matchingCards) {
+          if (seenCardIds.add(card.id)) {
+            matches.add(card);
+          }
+        }
+        if (matches.isNotEmpty) {
+          return matches;
+        }
+      } on CardApiException catch (error) {
+        lastError = error;
+        if (!error.toString().contains('server error')) {
+          rethrow;
+        }
+      }
+    }
+    if (lastError != null) {
+      if (!hasSuccessfulRequest) {
+        throw lastError;
+      }
+    }
+    return matches;
+  }
+
+  Future<List<TradingCard>> _searchAllPokemonPages(String pokemonQuery) async {
+    const pageSize = 250;
+    var page = 1;
+    var totalCount = 0;
+    final cards = <TradingCard>[];
+
+    while (true) {
+      final uri = Uri.https('api.pokemontcg.io', '/v2/cards', {
+        'q': pokemonQuery,
+        'page': '$page',
+        'pageSize': '$pageSize',
+      });
+      final response = await _getJsonClient(
+        uri,
+        headers: _config.pokemonTcgApiKey.isEmpty
+            ? const {}
+            : {'X-Api-Key': _config.pokemonTcgApiKey},
+      );
+      final data = response['data'];
+      if (data is! List) {
+        throw const CardApiException(
+          'Pokemon TCG API returned an invalid response.',
+        );
+      }
+      final pageCards = data
+          .whereType<Map<String, Object?>>()
+          .map(_parsePokemonCard)
+          .where((card) => card.price.marketPrice > 0)
+          .toList();
+      cards.addAll(pageCards);
+
+      totalCount = _asInt(response['totalCount']) ?? totalCount;
+      if (data.length < pageSize ||
+          (totalCount > 0 && page * pageSize >= totalCount)) {
+        return cards;
+      }
+      page += 1;
+    }
+  }
+
+  List<String> _pokemonQueries(String query) {
+    final words = query
+        .toLowerCase()
+        .split(RegExp(r'[^a-z]+'))
+        .where((word) => word.length > 1)
+        .toList();
+    final queryNames = <String>{};
+    for (var length = words.length.clamp(0, 4); length > 0; length -= 1) {
+      for (var start = 0; start + length <= words.length; start += 1) {
+        final candidate = words.skip(start).take(length).toList();
+        if (candidate.every(_genericPokemonNameTerms.contains)) {
+          continue;
+        }
+        queryNames.add(candidate.join(' '));
+      }
+    }
+
+    for (final name in queryNames.toList()) {
+      final broaderName = _escapeLucenePhrase(
+        name
+            .split(' ')
+            .where((word) => !_genericPokemonNameTerms.contains(word))
+            .join(' '),
+      );
+      if (broaderName.isNotEmpty && broaderName != name) {
+        queryNames.add(broaderName);
+      }
+    }
+
+    return queryNames.isEmpty
+        ? const ['name:"pokemon"']
+        : [
+            for (final name in queryNames)
+              'name:"${_escapeLucenePhrase(name)}"',
+          ];
+  }
+
+  bool _cardMatchesQuery(TradingCard card, String query) {
+    final haystack =
+        '${card.name} ${card.setName} ${card.collectorNumber} ${card.rarity} ${card.variant}'
+            .toLowerCase();
+    final normalizedNumber = card.collectorNumber.replaceFirst(
+      RegExp(r'^0+(?=\d)'),
+      '',
+    );
+    final terms = query
+        .toLowerCase()
+        .split(RegExp(r'[^a-z0-9]+'))
+        .where((term) => term.isNotEmpty)
+        .toList();
+    return terms.every((term) {
+      if (haystack.contains(term)) {
+        return true;
+      }
+      final normalizedTerm = term.replaceFirst(RegExp(r'^0+(?=\d)'), '');
+      return normalizedTerm.isNotEmpty &&
+          normalizedNumber.contains(normalizedTerm);
+    });
+  }
+
+  TradingCard _parsePokemonCard(Map<String, Object?> json) {
+    final tcgplayer = _asMap(json['tcgplayer']);
+    final cardmarket = _asMap(json['cardmarket']);
+    final tcgPrice = _bestTcgPlayerPrice(_asMap(tcgplayer['prices']));
+    final cardmarketPrice = _asDouble(
+      _asMap(cardmarket['prices'])['averageSellPrice'],
+    );
+    final set = _asMap(json['set']);
+    final printedTotal = set['printedTotal']?.toString();
+    final number = json['number']?.toString() ?? '';
+    final collectorNumber = printedTotal == null || printedTotal.isEmpty
+        ? number
+        : '$number/$printedTotal';
+    final price = tcgPrice.$1 ?? cardmarketPrice ?? 0;
+    final currency = tcgPrice.$1 == null && cardmarketPrice != null
+        ? 'EUR'
+        : 'USD';
+    final updatedAt =
+        tcgplayer['updatedAt']?.toString() ??
+        cardmarket['updatedAt']?.toString();
+
+    return TradingCard(
+      id: json['id']?.toString() ?? '',
+      game: TcgGame.pokemon,
+      name: json['name']?.toString() ?? 'Unknown Pokemon card',
+      setName: set['name']?.toString() ?? 'Unknown set',
+      collectorNumber: collectorNumber,
+      rarity: json['rarity']?.toString() ?? 'Unknown rarity',
+      variant: tcgPrice.$2,
+      price: PriceInfo(
+        marketPrice: price,
+        currency: currency,
+        source: currency == 'EUR'
+            ? 'Pokemon TCG API Cardmarket'
+            : 'Pokemon TCG API TCGPlayer',
+        freshness: updatedAt == null
+            ? 'Freshness unavailable'
+            : 'Updated $updatedAt',
+      ),
+      imageUrl: _asMap(json['images'])['small']?.toString(),
+    );
+  }
+
+  (double?, String) _bestTcgPlayerPrice(Map<String, Object?> prices) {
+    const preference = [
+      'holofoil',
+      'reverseHolofoil',
+      'normal',
+      '1stEditionHolofoil',
+      '1stEditionNormal',
+    ];
+    for (final key in preference) {
+      final priceMap = _asMap(prices[key]);
+      final market =
+          _asDouble(priceMap['market']) ?? _asDouble(priceMap['mid']);
+      if (market != null) {
+        return (market, _variantLabel(key));
+      }
+    }
+    return (null, 'Market');
+  }
+
+  String _variantLabel(String key) {
+    return switch (key) {
+      'reverseHolofoil' => 'Reverse Holofoil',
+      '1stEditionHolofoil' => '1st Edition Holofoil',
+      '1stEditionNormal' => '1st Edition Normal',
+      _ => key[0].toUpperCase() + key.substring(1),
+    };
+  }
+
+  String _escapeLucenePhrase(String input) {
+    return input
+        .replaceAll(RegExp(r'[^A-Za-z0-9 ]'), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+}
+
+const _genericPokemonNameTerms = {'ex', 'gx', 'v', 'vmax', 'vstar'};
+
+class TcgApiClient {
+  TcgApiClient(this._config, {JsonGetter getJson = _getJson})
+    : _getJsonClient = getJson;
+
+  final ApiConfig _config;
+  final JsonGetter _getJsonClient;
+
+  Future<List<TradingCard>> searchCards(TcgGame game, String query) async {
+    final uri = Uri.https('api.tcgapi.dev', '/v1/search', {
+      'q': query,
+      'game': game.code,
+    });
+    final response = await _getJsonClient(
+      uri,
+      headers: _config.tcgApiKey.isEmpty
+          ? const {}
+          : {'X-API-Key': _config.tcgApiKey},
+    );
+    final data = response['data'];
+    if (data is! List) {
+      throw const CardApiException('TCG API returned an invalid response.');
+    }
+    return data
+        .whereType<Map<String, Object?>>()
+        .map((json) => _parseTcgApiCard(game, json))
+        .where((card) => card.price.marketPrice > 0)
+        .toList();
+  }
+
+  TradingCard _parseTcgApiCard(TcgGame game, Map<String, Object?> json) {
+    final prices = _asMap(json['prices']);
+    final price =
+        _asDouble(json['price']) ??
+        _asDouble(json['market_price']) ??
+        _asDouble(prices['market']) ??
+        0;
+    final set = _asMap(json['set']);
+
+    return TradingCard(
+      id: json['id']?.toString() ?? json['card_id']?.toString() ?? '',
+      game: game,
+      name: json['name']?.toString() ?? 'Unknown card',
+      setName:
+          json['set_name']?.toString() ??
+          set['name']?.toString() ??
+          'Unknown set',
+      collectorNumber:
+          json['collector_number']?.toString() ??
+          json['number']?.toString() ??
+          '',
+      rarity: json['rarity']?.toString() ?? 'Unknown rarity',
+      variant:
+          json['printing']?.toString() ??
+          json['variant']?.toString() ??
+          'Market',
+      price: PriceInfo(
+        marketPrice: price,
+        currency: json['currency']?.toString() ?? 'USD',
+        source: prices.isEmpty ? 'TCG API' : 'TCG API market price',
+        freshness:
+            json['last_updated_at']?.toString() ??
+            json['last_updated']?.toString() ??
+            'Freshness unavailable',
+      ),
+      imageUrl: json['image_url']?.toString() ?? json['image']?.toString(),
+    );
+  }
+}
+
+Future<Map<String, Object?>> _getJson(
+  Uri uri, {
+  Map<String, String> headers = const {},
+}) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+  try {
+    final request = await client.getUrl(uri);
+    request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+    request.headers.set(HttpHeaders.userAgentHeader, 'SefCG/1.0');
+    for (final entry in headers.entries) {
+      request.headers.set(entry.key, entry.value);
+    }
+    final response = await request.close().timeout(const Duration(seconds: 20));
+    final body = await utf8.decodeStream(response);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw CardApiException(_apiFailureMessage(response.statusCode, body));
+    }
+    final decoded = jsonDecode(body);
+    if (decoded is Map<String, Object?>) {
+      return decoded;
+    }
+    throw const CardApiException('API returned an invalid JSON payload.');
+  } on SocketException catch (error) {
+    throw CardApiException('Network error: ${error.message}');
+  } on HttpException catch (error) {
+    throw CardApiException('HTTP error: ${error.message}');
+  } on TimeoutException {
+    throw const CardApiException('API request timed out.');
+  } on FormatException {
+    throw const CardApiException('API returned malformed JSON.');
+  } finally {
+    client.close(force: true);
+  }
+}
+
+String _apiFailureMessage(int statusCode, String body) {
+  if (statusCode == 402 && body.contains('X-PAYMENT')) {
+    return 'TCG API requires an X-PAYMENT authorization for search. Use Pokemon search without TCG credentials, or run Riftbound search through a backend that can attach the required payment header.';
+  }
+  if (statusCode == 401 || statusCode == 403) {
+    return 'API request is not authorized. Check the configured API key or backend credentials.';
+  }
+  if (statusCode >= 500) {
+    return 'API server error ($statusCode). Try again later.';
+  }
+  return 'API request failed ($statusCode). $body';
+}
+
+Map<String, Object?> _asMap(Object? value) {
+  if (value is Map) {
+    return value.map((key, value) => MapEntry(key.toString(), value));
+  }
+  return const {};
+}
+
+double? _asDouble(Object? value) {
+  if (value is num) {
+    return value.toDouble();
+  }
+  if (value is String) {
+    return double.tryParse(value);
+  }
+  return null;
+}
+
+int? _asInt(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value);
+  }
+  return null;
+}
 
 class SefCgApp extends StatelessWidget {
-  const SefCgApp({super.key});
+  const SefCgApp({super.key, required this.repository});
+
+  final CardPriceRepository repository;
 
   @override
   Widget build(BuildContext context) {
@@ -206,13 +582,15 @@ class SefCgApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF2563EB)),
         useMaterial3: true,
       ),
-      home: const AppShell(),
+      home: AppShell(repository: repository),
     );
   }
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({super.key});
+  const AppShell({super.key, required this.repository});
+
+  final CardPriceRepository repository;
 
   @override
   State<AppShell> createState() => _AppShellState();
@@ -221,14 +599,7 @@ class AppShell extends StatefulWidget {
 class _AppShellState extends State<AppShell> {
   var _selectedIndex = 0;
   var _selectedGame = TcgGame.pokemon;
-  final _collection = <CollectionEntry>[
-    CollectionEntry(
-      card: sampleCards[2],
-      quantity: 1,
-      purchasePrice: 120,
-      condition: 'Near Mint',
-    ),
-  ];
+  final _collection = <CollectionEntry>[];
 
   void _openCard(TradingCard card) {
     Navigator.of(context).push(
@@ -260,11 +631,13 @@ class _AppShellState extends State<AppShell> {
   Widget build(BuildContext context) {
     final screens = [
       SearchScreen(
+        repository: widget.repository,
         selectedGame: _selectedGame,
         onGameChanged: (game) => setState(() => _selectedGame = game),
         onOpenCard: _openCard,
       ),
       ScannerScreen(
+        repository: widget.repository,
         selectedGame: _selectedGame,
         onGameChanged: (game) => setState(() => _selectedGame = game),
         onOpenCard: _openCard,
@@ -297,11 +670,13 @@ class _AppShellState extends State<AppShell> {
 class SearchScreen extends StatefulWidget {
   const SearchScreen({
     super.key,
+    required this.repository,
     required this.selectedGame,
     required this.onGameChanged,
     required this.onOpenCard,
   });
 
+  final CardPriceRepository repository;
   final TcgGame selectedGame;
   final ValueChanged<TcgGame> onGameChanged;
   final ValueChanged<TradingCard> onOpenCard;
@@ -312,6 +687,18 @@ class SearchScreen extends StatefulWidget {
 
 class _SearchScreenState extends State<SearchScreen> {
   final _queryController = TextEditingController();
+  List<TradingCard> _results = const [];
+  Object? _error;
+  var _isLoading = false;
+  var _requestId = 0;
+
+  @override
+  void didUpdateWidget(SearchScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.selectedGame != widget.selectedGame) {
+      _search();
+    }
+  }
 
   @override
   void dispose() {
@@ -319,22 +706,45 @@ class _SearchScreenState extends State<SearchScreen> {
     super.dispose();
   }
 
-  List<TradingCard> get _results {
-    final query = _queryController.text.trim().toLowerCase();
-    return sampleCards.where((card) {
-      if (card.game != widget.selectedGame) {
-        return false;
+  Future<void> _search() async {
+    final query = _queryController.text.trim();
+    final requestId = ++_requestId;
+    if (query.isEmpty) {
+      setState(() {
+        _results = const [];
+        _error = null;
+        _isLoading = false;
+      });
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final results = await widget.repository.searchCards(
+        widget.selectedGame,
+        query,
+      );
+      if (!mounted || requestId != _requestId) {
+        return;
       }
-      if (query.isEmpty) {
-        return true;
+      setState(() {
+        _results = results;
+        _isLoading = false;
+      });
+    } catch (error) {
+      if (!mounted || requestId != _requestId) {
+        return;
       }
-      final haystack = '${card.name} ${card.collectorNumber} ${card.setName}'
-          .toLowerCase();
-      return query
-          .split(RegExp(r'\s+'))
-          .where((token) => token.isNotEmpty)
-          .every(haystack.contains);
-    }).toList();
+      setState(() {
+        _results = const [];
+        _error = error;
+        _isLoading = false;
+      });
+    }
   }
 
   @override
@@ -355,35 +765,82 @@ class _SearchScreenState extends State<SearchScreen> {
           const SizedBox(height: 16),
           TextField(
             controller: _queryController,
-            onChanged: (_) => setState(() {}),
-            decoration: const InputDecoration(
-              prefixIcon: Icon(Icons.search),
+            onSubmitted: (_) => _search(),
+            decoration: InputDecoration(
+              prefixIcon: const Icon(Icons.search),
+              suffixIcon: IconButton(
+                tooltip: 'Search',
+                onPressed: _search,
+                icon: const Icon(Icons.arrow_forward),
+              ),
               labelText: 'Search name, number, or set',
-              border: OutlineInputBorder(),
+              border: const OutlineInputBorder(),
             ),
           ),
           const SizedBox(height: 16),
-          Text(
-            '${_results.length} matching cards',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 8),
-          for (final card in _results)
-            CardTile(card: card, onTap: () => widget.onOpenCard(card)),
+          if (_isLoading)
+            const Center(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: CircularProgressIndicator(),
+              ),
+            )
+          else if (_error != null)
+            EmptyState(
+              icon: Icons.cloud_off,
+              title: _errorTitle(_error),
+              message: _error.toString(),
+            )
+          else if (_queryController.text.trim().isEmpty)
+            const EmptyState(
+              icon: Icons.manage_search,
+              title: 'Search live card prices',
+              message: 'Enter a card name, collector number, or set.',
+            )
+          else if (_results.isEmpty)
+            const EmptyState(
+              icon: Icons.search_off,
+              title: 'No cards found',
+              message: 'Try a broader name or number.',
+            )
+          else ...[
+            Text(
+              '${_results.length} matching cards',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            for (final card in _results)
+              CardTile(card: card, onTap: () => widget.onOpenCard(card)),
+          ],
         ],
       ),
     );
+  }
+
+  String _errorTitle(Object? error) {
+    final message = error.toString();
+    if (message.contains('X-PAYMENT') ||
+        message.contains('not authorized') ||
+        message.contains('API key')) {
+      return 'API credentials required';
+    }
+    if (message.contains('server error')) {
+      return 'Price API error';
+    }
+    return 'Price API unavailable';
   }
 }
 
 class ScannerScreen extends StatefulWidget {
   const ScannerScreen({
     super.key,
+    required this.repository,
     required this.selectedGame,
     required this.onGameChanged,
     required this.onOpenCard,
   });
 
+  final CardPriceRepository repository;
   final TcgGame selectedGame;
   final ValueChanged<TcgGame> onGameChanged;
   final ValueChanged<TradingCard> onOpenCard;
@@ -395,7 +852,9 @@ class ScannerScreen extends StatefulWidget {
 class _ScannerScreenState extends State<ScannerScreen> {
   final _ocrController = TextEditingController();
   List<CandidateMatch> _candidates = const [];
+  Object? _error;
   bool _hasScanned = false;
+  bool _isLoading = false;
 
   @override
   void dispose() {
@@ -403,49 +862,40 @@ class _ScannerScreenState extends State<ScannerScreen> {
     super.dispose();
   }
 
-  void _useSampleScan() {
-    _ocrController.text = widget.selectedGame == TcgGame.pokemon
-        ? 'Pikachu ex 057/191 Double Rare'
-        : 'Jinx Loose Cannon 041/298 Champion';
-    _runRecognition();
-  }
-
-  void _runRecognition() {
-    final evidence = _ocrController.text.trim().toLowerCase();
-    final matches =
-        sampleCards
-            .where((card) => card.game == widget.selectedGame)
-            .map(
-              (card) =>
-                  CandidateMatch(card: card, score: _score(card, evidence)),
-            )
-            .where((match) => match.score > 0)
-            .toList()
-          ..sort((a, b) => b.score.compareTo(a.score));
+  Future<void> _runRecognition() async {
+    final evidence = _ocrController.text.trim();
+    if (evidence.isEmpty) {
+      return;
+    }
 
     setState(() {
+      _isLoading = true;
       _hasScanned = true;
-      _candidates = matches.take(5).toList();
+      _error = null;
     });
-  }
 
-  int _score(TradingCard card, String evidence) {
-    var score = 0;
-    if (evidence.contains(card.collectorNumber.toLowerCase())) {
-      score += 70;
-    }
-    if (evidence.contains(card.setName.toLowerCase())) {
-      score += 20;
-    }
-    for (final token in card.name.toLowerCase().split(RegExp(r'[\s,]+'))) {
-      if (token.length > 2 && evidence.contains(token)) {
-        score += 12;
+    try {
+      final candidates = await widget.repository.identifyCard(
+        widget.selectedGame,
+        evidence,
+      );
+      if (!mounted) {
+        return;
       }
+      setState(() {
+        _candidates = candidates;
+        _isLoading = false;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _candidates = const [];
+        _error = error;
+        _isLoading = false;
+      });
     }
-    if (evidence.contains(card.rarity.toLowerCase())) {
-      score += 8;
-    }
-    return score;
   }
 
   @override
@@ -460,7 +910,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
         children: [
           const AppHeader(
             title: 'Card Scanner',
-            subtitle: 'OCR-first matching ranks exact numbers before artwork.',
+            subtitle: 'Paste OCR text to match live priced printings.',
           ),
           const SizedBox(height: 16),
           GameSelector(
@@ -482,25 +932,26 @@ class _ScannerScreenState extends State<ScannerScreen> {
             ),
           ),
           const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: _runRecognition,
-                  icon: const Icon(Icons.manage_search),
-                  label: const Text('Match Card'),
-                ),
-              ),
-              const SizedBox(width: 12),
-              IconButton.filledTonal(
-                tooltip: 'Use sample scan',
-                onPressed: _useSampleScan,
-                icon: const Icon(Icons.auto_fix_high),
-              ),
-            ],
+          FilledButton.icon(
+            onPressed: _isLoading ? null : _runRecognition,
+            icon: const Icon(Icons.manage_search),
+            label: const Text('Match Card'),
           ),
           const SizedBox(height: 20),
-          if (_hasScanned && _candidates.isEmpty)
+          if (_isLoading)
+            const Center(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: CircularProgressIndicator(),
+              ),
+            )
+          else if (_error != null)
+            EmptyState(
+              icon: Icons.cloud_off,
+              title: _errorTitle(_error),
+              message: _error.toString(),
+            )
+          else if (_hasScanned && _candidates.isEmpty)
             const EmptyState(
               icon: Icons.error_outline,
               title: 'No confident candidates',
@@ -528,6 +979,19 @@ class _ScannerScreenState extends State<ScannerScreen> {
         ],
       ),
     );
+  }
+
+  String _errorTitle(Object? error) {
+    final message = error.toString();
+    if (message.contains('X-PAYMENT') ||
+        message.contains('not authorized') ||
+        message.contains('API key')) {
+      return 'API credentials required';
+    }
+    if (message.contains('server error')) {
+      return 'Price API error';
+    }
+    return 'Price API unavailable';
   }
 }
 
@@ -732,6 +1196,36 @@ class CardPreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final width = height * 0.72;
+    final imageUrl = card.imageUrl;
+    if (imageUrl != null && imageUrl.isNotEmpty) {
+      return Semantics(
+        label: '${card.name} card image',
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Image.network(
+            imageUrl,
+            width: width,
+            height: height,
+            fit: BoxFit.cover,
+            errorBuilder: (_, _, _) =>
+                _CardPlaceholder(card: card, height: height),
+          ),
+        ),
+      );
+    }
+    return _CardPlaceholder(card: card, height: height);
+  }
+}
+
+class _CardPlaceholder extends StatelessWidget {
+  const _CardPlaceholder({required this.card, required this.height});
+
+  final TradingCard card;
+  final double height;
+
+  @override
+  Widget build(BuildContext context) {
+    final width = height * 0.72;
     final compact = height < 80;
     return Semantics(
       label: '${card.name} card image placeholder',
@@ -744,7 +1238,9 @@ class CardPreview extends StatelessWidget {
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: card.palette,
+            colors: card.game == TcgGame.pokemon
+                ? const [Color(0xFFFFD447), Color(0xFF2F6FDB)]
+                : const [Color(0xFF14B8A6), Color(0xFF0F172A)],
           ),
           boxShadow: const [
             BoxShadow(
