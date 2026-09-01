@@ -1,6 +1,6 @@
-# SefCG
+# SefTCG
 
-SefCG is now a Flutter application targeting Android and iOS.
+SefTCG is now a Flutter application targeting Android and iOS.
 
 ## Requirements
 
