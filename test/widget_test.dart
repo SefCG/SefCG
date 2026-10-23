@@ -1,9 +1,181 @@
+import 'dart:io';
+
+import 'package:sefcg/collection_store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:sefcg/main.dart';
 
 void main() {
+  test(
+    'file storage restores full collection and replaces older snapshots',
+    () async {
+      final directory = await Directory.systemTemp.createTemp(
+        'sefcg_collection_test_',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      FileCollectionStore store() =>
+          FileCollectionStore(directory: () async => directory);
+      expect(await store().load(), isEmpty);
+      final entry = CollectionEntry(
+        card: _FakeCardPriceRepository._cards.first,
+        quantity: 3,
+        purchasePrice: 8.5,
+        condition: 'Near Mint',
+      );
+      await store().save([entry, entry]);
+      final restored = await store().load();
+      expect(restored, hasLength(2));
+      expect(restored.first.quantity, 3);
+      expect(restored.first.purchasePrice, 8.5);
+      expect(restored.first.card.id, entry.card.id);
+      expect(restored.first.card.price.currency, 'USD');
+      expect(restored.first.card.price.marketPrice, 12.4);
+      expect(restored.first.gainLoss, closeTo(11.7, 0.001));
+      await store().save([entry]);
+      expect(await store().load(), hasLength(1));
+      await store().save([]);
+      expect(await store().load(), isEmpty);
+    },
+  );
+
+  test('corrupt saved data is reported and preserved', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'sefcg_corrupt_test_',
+    );
+    addTearDown(() => directory.delete(recursive: true));
+    final file = File('${directory.path}/collection.json');
+    await file.writeAsString('invalid json');
+    final store = FileCollectionStore(directory: () async => directory);
+    await expectLater(store.load(), throwsFormatException);
+    expect(await file.readAsString(), 'invalid json');
+  });
+
+  testWidgets(
+    'saved edits survive a new app and failed saves preserve old values',
+    (tester) async {
+      final store = _MemoryStore();
+      store.entries = [
+        CollectionEntry(
+          card: _FakeCardPriceRepository._cards.first,
+          quantity: 2,
+          purchasePrice: 10,
+          condition: 'Near Mint',
+        ),
+      ];
+      Future<void> openCollection() async {
+        await tester.pumpWidget(
+          SefCgApp(
+            repository: _FakeCardPriceRepository(),
+            collectionStore: store,
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('collection_nav')));
+        await tester.pumpAndSettle();
+      }
+
+      await openCollection();
+      await tester.drag(find.byType(ListView), const Offset(0, -300));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Edit purchase'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('purchase_price')), '9');
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+      expect(store.entries.single.purchasePrice, 9);
+      await tester.pumpWidget(const SizedBox());
+      await openCollection();
+      await tester.drag(find.byType(ListView), const Offset(0, -300));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Bought: USD 9.00 each'), findsOneWidget);
+      store.failSave = true;
+      await tester.tap(find.byTooltip('Edit purchase'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('purchase_price')), '20');
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+      expect(store.entries.single.purchasePrice, 9);
+      expect(find.textContaining('Could not save collection.'), findsOneWidget);
+    },
+  );
+
+  test('portfolio accounts for quantities, losses, gifts and currencies', () {
+    final card = _FakeCardPriceRepository._cards.first;
+    final entries = [
+      CollectionEntry(
+        card: card,
+        quantity: 2,
+        purchasePrice: 10,
+        condition: 'Near Mint',
+      ),
+      CollectionEntry(
+        card: card,
+        quantity: 1,
+        purchasePrice: 20,
+        condition: 'Near Mint',
+      ),
+    ];
+    final summary = PortfolioSummary.fromEntries(entries, 'USD');
+    expect(summary.currentValue, closeTo(37.2, 0.001));
+    expect(summary.acquisitionCost, 40);
+    expect(summary.gainLoss, closeTo(-2.8, 0.001));
+    expect(entries.first.gainLoss, closeTo(4.8, 0.001));
+    expect(
+      PortfolioSummary.fromEntries([
+        CollectionEntry(
+          card: card,
+          quantity: 1,
+          purchasePrice: 0,
+          condition: 'Near Mint',
+        ),
+      ], 'USD').returnRate,
+      isNull,
+    );
+  });
+
+  testWidgets(
+    'purchase form validates input and saves custom price and quantity',
+    (tester) async {
+      CollectionEntry? saved;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: TextButton(
+                onPressed: () async {
+                  saved = await showDialog<CollectionEntry>(
+                    context: context,
+                    builder: (_) => CollectionEntryDialog(
+                      card: _FakeCardPriceRepository._cards.first,
+                    ),
+                  );
+                },
+                child: const Text('Add'),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Add'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('purchase_price')), '-1');
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Enter a non-negative amount with up to 2 decimals.'),
+        findsOneWidget,
+      );
+      await tester.enterText(find.byKey(const Key('purchase_price')), '8.50');
+      await tester.enterText(find.byKey(const Key('purchase_quantity')), '3');
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+      expect(saved?.purchasePrice, 8.5);
+      expect(saved?.quantity, 3);
+      expect(saved?.gainLoss, closeTo(11.7, 0.001));
+    },
+  );
+
   test('TCG API client searches without an API key', () async {
     Uri? requestedUri;
     Map<String, String>? requestedHeaders;
@@ -208,6 +380,7 @@ void main() {
   ) async {
     await tester.pumpWidget(
       SefCgApp(
+        collectionStore: _MemoryStore(),
         repository: _ThrowingCardPriceRepository(
           const CardApiException(
             'TCG API requires an X-PAYMENT authorization.',
@@ -216,6 +389,7 @@ void main() {
       ),
     );
 
+    await tester.pumpAndSettle();
     await tester.enterText(find.byType(TextField).first, 'jinx');
     await tester.tap(find.byIcon(Icons.arrow_forward));
     await tester.pumpAndSettle();
@@ -224,11 +398,18 @@ void main() {
   });
 
   testWidgets('search shows exact printings and card prices', (tester) async {
-    await tester.pumpWidget(SefCgApp(repository: _FakeCardPriceRepository()));
+    await tester.pumpWidget(
+      SefCgApp(
+        collectionStore: _MemoryStore(),
+        repository: _FakeCardPriceRepository(),
+      ),
+    );
 
+    await tester.pumpAndSettle();
     expect(find.text('TCG Price Checker'), findsOneWidget);
     expect(find.text('Search live card prices'), findsOneWidget);
 
+    await tester.pumpAndSettle();
     await tester.enterText(find.byType(TextField).first, 'pikachu 057');
     await tester.tap(find.byIcon(Icons.arrow_forward));
     await tester.pumpAndSettle();
@@ -239,8 +420,14 @@ void main() {
   });
 
   testWidgets('game selector switches search provider', (tester) async {
-    await tester.pumpWidget(SefCgApp(repository: _FakeCardPriceRepository()));
+    await tester.pumpWidget(
+      SefCgApp(
+        collectionStore: _MemoryStore(),
+        repository: _FakeCardPriceRepository(),
+      ),
+    );
 
+    await tester.pumpAndSettle();
     await tester.enterText(find.byType(TextField).first, 'jinx');
     await tester.tap(find.text('Riftbound'));
     await tester.pumpAndSettle();
@@ -285,13 +472,19 @@ void main() {
   testWidgets('collection tab starts empty without mock portfolio data', (
     tester,
   ) async {
-    await tester.pumpWidget(SefCgApp(repository: _FakeCardPriceRepository()));
+    await tester.pumpWidget(
+      SefCgApp(
+        collectionStore: _MemoryStore(),
+        repository: _FakeCardPriceRepository(),
+      ),
+    );
 
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('collection_nav')));
     await tester.pumpAndSettle();
 
     expect(find.text('Collection Portfolio'), findsOneWidget);
-    expect(find.text('Estimated Value'), findsOneWidget);
+    expect(find.text('Collection Net Worth'), findsOneWidget);
     expect(find.text('Unrealised Gain/Loss'), findsOneWidget);
     expect(find.text('No cards yet'), findsOneWidget);
   });
@@ -392,5 +585,17 @@ class _FakeCardPriceRepository implements CardPriceRepository {
               .toLowerCase();
       return tokens.every(haystack.contains);
     }).toList();
+  }
+}
+
+class _MemoryStore implements CollectionStore {
+  List<CollectionEntry> entries = [];
+  bool failSave = false;
+  @override
+  Future<List<CollectionEntry>> load() async => List.of(entries);
+  @override
+  Future<void> save(List<CollectionEntry> values) async {
+    if (failSave) throw const FileSystemException('Test write failure');
+    entries = List.of(values);
   }
 }

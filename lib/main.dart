@@ -4,6 +4,8 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'collection_store.dart';
+
 void main() {
   runApp(SefCgApp(repository: RealCardPriceRepository()));
 }
@@ -569,7 +571,9 @@ int? _asInt(Object? value) {
 }
 
 class SefCgApp extends StatelessWidget {
-  const SefCgApp({super.key, required this.repository});
+  const SefCgApp({super.key, required this.repository, this.collectionStore});
+
+  final CollectionStore? collectionStore;
 
   final CardPriceRepository repository;
 
@@ -582,13 +586,15 @@ class SefCgApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF2563EB)),
         useMaterial3: true,
       ),
-      home: AppShell(repository: repository),
+      home: AppShell(repository: repository, collectionStore: collectionStore),
     );
   }
 }
 
 class AppShell extends StatefulWidget {
-  const AppShell({super.key, required this.repository});
+  const AppShell({super.key, required this.repository, this.collectionStore});
+
+  final CollectionStore? collectionStore;
 
   final CardPriceRepository repository;
 
@@ -601,6 +607,63 @@ class _AppShellState extends State<AppShell> {
   var _selectedGame = TcgGame.pokemon;
   final _collection = <CollectionEntry>[];
 
+  late final CollectionStore _store =
+      widget.collectionStore ?? FileCollectionStore();
+  bool _loading = true;
+  bool _saving = false;
+  bool _loadFailed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCollection();
+  }
+
+  Future<void> _loadCollection() async {
+    setState(() {
+      _loading = true;
+      _loadFailed = false;
+    });
+    try {
+      final entries = await _store.load();
+      if (!mounted) return;
+      setState(() {
+        _collection.clear();
+        _collection.addAll(entries);
+      });
+    } catch (_) {
+      if (mounted) setState(() => _loadFailed = true);
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<bool> _saveCollection(List<CollectionEntry> entries) async {
+    setState(() => _saving = true);
+    try {
+      await _store.save(entries);
+      if (!mounted) return false;
+      setState(() {
+        _collection.clear();
+        _collection.addAll(entries);
+      });
+      return true;
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Could not save collection. Your previous collection is unchanged. Please try again.',
+            ),
+          ),
+        );
+      }
+      return false;
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   void _openCard(TradingCard card) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -610,25 +673,109 @@ class _AppShellState extends State<AppShell> {
     );
   }
 
-  void _addToCollection(TradingCard card) {
-    setState(() {
-      _collection.add(
-        CollectionEntry(
-          card: card,
-          quantity: 1,
-          purchasePrice: card.price.marketPrice,
-          condition: 'Near Mint',
-        ),
-      );
-    });
-
+  Future<void> _addToCollection(TradingCard card) async {
+    if (_saving || _refreshing) return;
+    final entry = await showDialog<CollectionEntry>(
+      context: context,
+      builder: (_) => CollectionEntryDialog(card: card),
+    );
+    if (entry == null || !mounted) return;
+    if (!await _saveCollection([..._collection, entry]) || !mounted) return;
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text('${card.name} added to collection')));
   }
 
+  Future<void> _editEntry(CollectionEntry entry) async {
+    final updated = await showDialog<CollectionEntry>(
+      context: context,
+      builder: (_) => CollectionEntryDialog(card: entry.card, entry: entry),
+    );
+    if (updated == null || !mounted) return;
+    final index = _collection.indexOf(entry);
+    if (index >= 0) {
+      final entries = List<CollectionEntry>.of(_collection);
+      entries[index] = updated;
+      await _saveCollection(entries);
+    }
+  }
+
+  bool _refreshing = false;
+
+  Future<void> _refreshPrices() async {
+    setState(() => _refreshing = true);
+    var failures = 0;
+    final updatedEntries = List<CollectionEntry>.of(_collection);
+    for (final entry in List<CollectionEntry>.of(_collection)) {
+      try {
+        final cards = await widget.repository.searchCards(
+          entry.card.game,
+          entry.card.name,
+        );
+        final matches = cards.where(
+          (card) =>
+              card.id == entry.card.id &&
+              card.variant == entry.card.variant &&
+              card.price.currency == entry.card.price.currency &&
+              card.price.marketPrice.isFinite &&
+              card.price.marketPrice >= 0,
+        );
+        if (matches.isEmpty) {
+          failures++;
+          continue;
+        }
+        if (!mounted) return;
+        final index = _collection.indexOf(entry);
+        if (index >= 0) {
+          updatedEntries[index] = CollectionEntry(
+            card: matches.first,
+            quantity: entry.quantity,
+            purchasePrice: entry.purchasePrice,
+            condition: entry.condition,
+          );
+        }
+      } catch (_) {
+        failures++;
+      }
+    }
+    if (!mounted) return;
+    final saved = await _saveCollection(updatedEntries);
+    if (!mounted) return;
+    setState(() => _refreshing = false);
+    if (!saved) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          failures == 0
+              ? 'Market prices updated'
+              : '$failures prices could not be updated. Previous values retained.',
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_loading || _loadFailed) {
+      return Scaffold(
+        body: Center(
+          child: _loading
+              ? const CircularProgressIndicator()
+              : Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'Could not load your saved collection. Saved data has been left untouched.',
+                    ),
+                    TextButton(
+                      onPressed: _loadCollection,
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+        ),
+      );
+    }
     final screens = [
       SearchScreen(
         repository: widget.repository,
@@ -642,15 +789,30 @@ class _AppShellState extends State<AppShell> {
         onGameChanged: (game) => setState(() => _selectedGame = game),
         onOpenCard: _openCard,
       ),
-      CollectionScreen(entries: _collection, onOpenCard: _openCard),
+      CollectionScreen(
+        entries: _collection,
+        onOpenCard: _openCard,
+        onEditEntry: _refreshing ? null : _editEntry,
+        onRefresh: _refreshPrices,
+        refreshing: _refreshing,
+      ),
     ];
 
     return Scaffold(
-      body: screens[_selectedIndex],
+      body: Stack(
+        children: [
+          screens[_selectedIndex],
+          if (_saving || _refreshing) ...[
+            const ModalBarrier(dismissible: false, color: Colors.black26),
+            const Center(child: CircularProgressIndicator()),
+          ],
+        ],
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _selectedIndex,
-        onDestinationSelected: (index) =>
-            setState(() => _selectedIndex = index),
+        onDestinationSelected: _saving || _refreshing
+            ? null
+            : (index) => setState(() => _selectedIndex = index),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.search), label: 'Search'),
           NavigationDestination(
@@ -995,44 +1157,163 @@ class _ScannerScreenState extends State<ScannerScreen> {
   }
 }
 
+class CollectionEntryDialog extends StatefulWidget {
+  const CollectionEntryDialog({super.key, required this.card, this.entry});
+  final TradingCard card;
+  final CollectionEntry? entry;
+
+  @override
+  State<CollectionEntryDialog> createState() => _CollectionEntryDialogState();
+}
+
+class _CollectionEntryDialogState extends State<CollectionEntryDialog> {
+  final _form = GlobalKey<FormState>();
+  late final _price = TextEditingController(
+    text: widget.entry?.purchasePrice.toStringAsFixed(2) ?? '',
+  );
+  late final _quantity = TextEditingController(
+    text: '${widget.entry?.quantity ?? 1}',
+  );
+
+  @override
+  void dispose() {
+    _price.dispose();
+    _quantity.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.entry == null ? 'Add to collection' : 'Edit purchase'),
+    content: SingleChildScrollView(
+      child: Form(
+        key: _form,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(widget.card.name),
+            TextFormField(
+              key: const Key('purchase_price'),
+              controller: _price,
+              decoration: InputDecoration(
+                labelText:
+                    'Bought price per card (${widget.card.price.currency})',
+                helperText: 'Enter 0 for a gift or free card.',
+              ),
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              validator: (value) {
+                final price = double.tryParse(value?.trim() ?? '');
+                if (price == null ||
+                    !price.isFinite ||
+                    price < 0 ||
+                    !RegExp(r'^\d+(\.\d{1,2})?$').hasMatch(value!.trim())) {
+                  return 'Enter a non-negative amount with up to 2 decimals.';
+                }
+                return null;
+              },
+            ),
+            TextFormField(
+              key: const Key('purchase_quantity'),
+              controller: _quantity,
+              decoration: const InputDecoration(labelText: 'Quantity'),
+              keyboardType: TextInputType.number,
+              validator: (value) {
+                final quantity = int.tryParse(value ?? '');
+                return quantity == null || quantity < 1 || quantity > 1000000
+                    ? 'Enter a quantity from 1 to 1000000.'
+                    : null;
+              },
+            ),
+          ],
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(
+        onPressed: () {
+          if (!_form.currentState!.validate()) return;
+          Navigator.pop(
+            context,
+            CollectionEntry(
+              card: widget.card,
+              quantity: int.parse(_quantity.text),
+              purchasePrice: double.parse(_price.text.trim()),
+              condition: widget.entry?.condition ?? 'Near Mint',
+            ),
+          );
+        },
+        child: const Text('Save'),
+      ),
+    ],
+  );
+}
+
 class CollectionScreen extends StatelessWidget {
   const CollectionScreen({
     super.key,
     required this.entries,
     required this.onOpenCard,
+    this.onEditEntry,
+    this.onRefresh,
+    this.refreshing = false,
   });
 
   final List<CollectionEntry> entries;
   final ValueChanged<TradingCard> onOpenCard;
+  final ValueChanged<CollectionEntry>? onEditEntry;
+  final VoidCallback? onRefresh;
+  final bool refreshing;
 
   @override
   Widget build(BuildContext context) {
-    final acquisitionCost = entries.fold<double>(
-      0,
-      (total, entry) => total + entry.acquisitionCost,
-    );
-    final currentValue = entries.fold<double>(
-      0,
-      (total, entry) => total + entry.currentValue,
-    );
-    final gainLoss = currentValue - acquisitionCost;
-    final returnRate = acquisitionCost == 0 ? 0.0 : gainLoss / acquisitionCost;
-
+    final currencies = entries
+        .map((entry) => entry.card.price.currency)
+        .toSet();
     return SafeArea(
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
         children: [
           const AppHeader(
             title: 'Collection Portfolio',
-            subtitle: 'Private estimated values and unrealised gain/loss.',
+            subtitle: 'Your card net worth and unrealised profit or loss.',
           ),
           const SizedBox(height: 16),
-          PortfolioSummary(
-            acquisitionCost: acquisitionCost,
-            currentValue: currentValue,
-            gainLoss: gainLoss,
-            returnRate: returnRate,
+          if (entries.isEmpty)
+            const PortfolioSummary(
+              acquisitionCost: 0,
+              currentValue: 0,
+              gainLoss: 0,
+              returnRate: null,
+              currency: 'USD',
+            ),
+          for (final currency in currencies)
+            PortfolioSummary.fromEntries(
+              entries
+                  .where((entry) => entry.card.price.currency == currency)
+                  .toList(),
+              currency,
+            ),
+          if (entries.isNotEmpty)
+            TextButton.icon(
+              onPressed: refreshing ? null : onRefresh,
+              icon: const Icon(Icons.refresh),
+              label: Text(
+                refreshing ? 'Refreshing prices?' : 'Refresh market prices',
+              ),
+            ),
+          const Text(
+            'Net worth = current card values. Profit/loss = current values minus bought prices. Totals include quantity.',
           ),
+          if (currencies.length > 1)
+            const Text(
+              'Currencies are shown separately; no exchange-rate conversion is applied.',
+            ),
           const SizedBox(height: 16),
           Text(
             'Personal Collection',
@@ -1047,11 +1328,14 @@ class CollectionScreen extends StatelessWidget {
             )
           else
             for (final entry in entries)
-              CollectionTile(entry: entry, onTap: () => onOpenCard(entry.card)),
+              CollectionTile(
+                entry: entry,
+                onTap: () => onOpenCard(entry.card),
+                onEdit: onEditEntry == null ? null : () => onEditEntry!(entry),
+              ),
           const SizedBox(height: 12),
-          Text(
-            'Values are estimates based on reference market pricing.',
-            style: Theme.of(context).textTheme.bodySmall,
+          const Text(
+            'Prices are market estimates. Use Refresh market prices to fetch the latest available values. Collection is saved automatically on this device.',
           ),
         ],
       ),
@@ -1396,12 +1680,35 @@ class PortfolioSummary extends StatelessWidget {
     required this.currentValue,
     required this.gainLoss,
     required this.returnRate,
+    required this.currency,
   });
 
   final double acquisitionCost;
   final double currentValue;
   final double gainLoss;
-  final double returnRate;
+  final double? returnRate;
+  final String currency;
+
+  factory PortfolioSummary.fromEntries(
+    List<CollectionEntry> entries,
+    String currency,
+  ) {
+    final cost = entries.fold<double>(
+      0,
+      (total, entry) => total + entry.acquisitionCost,
+    );
+    final value = entries.fold<double>(
+      0,
+      (total, entry) => total + entry.currentValue,
+    );
+    return PortfolioSummary(
+      acquisitionCost: cost,
+      currentValue: value,
+      gainLoss: value - cost,
+      returnRate: cost == 0 ? null : (value - cost) / cost,
+      currency: currency,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1411,20 +1718,23 @@ class PortfolioSummary extends StatelessWidget {
         child: Column(
           children: [
             MetricRow(
-              label: 'Estimated Value',
-              value: 'SGD ${currentValue.toStringAsFixed(2)}',
+              label: 'Collection Net Worth',
+              value: '$currency ${currentValue.toStringAsFixed(2)}',
             ),
             MetricRow(
               label: 'Acquisition Cost',
-              value: 'SGD ${acquisitionCost.toStringAsFixed(2)}',
+              value: '$currency ${acquisitionCost.toStringAsFixed(2)}',
             ),
             MetricRow(
               label: 'Unrealised Gain/Loss',
-              value: 'SGD ${gainLoss.toStringAsFixed(2)}',
+              value:
+                  '${gainLoss > 0 ? '+' : ''}$currency ${gainLoss.toStringAsFixed(2)}',
             ),
             MetricRow(
               label: 'Estimated Return',
-              value: '${(returnRate * 100).toStringAsFixed(1)}%',
+              value: returnRate == null
+                  ? 'N/A'
+                  : '${(returnRate! * 100).toStringAsFixed(1)}%',
             ),
           ],
         ),
@@ -1454,10 +1764,16 @@ class MetricRow extends StatelessWidget {
 }
 
 class CollectionTile extends StatelessWidget {
-  const CollectionTile({super.key, required this.entry, required this.onTap});
+  const CollectionTile({
+    super.key,
+    required this.entry,
+    required this.onTap,
+    this.onEdit,
+  });
 
   final CollectionEntry entry;
   final VoidCallback onTap;
+  final VoidCallback? onEdit;
 
   @override
   Widget build(BuildContext context) {
@@ -1467,9 +1783,23 @@ class CollectionTile extends StatelessWidget {
         leading: CardPreview(card: entry.card, height: 56),
         title: Text(entry.card.name),
         subtitle: Text(
-          '${entry.quantity}x - ${entry.condition} - Cost SGD ${entry.purchasePrice.toStringAsFixed(2)}',
+          '${entry.quantity}x - ${entry.condition}\n'
+          'Bought: ${entry.card.price.currency} ${entry.purchasePrice.toStringAsFixed(2)} each\n'
+          'Market: ${entry.card.price.currency} ${entry.card.price.marketPrice.toStringAsFixed(2)} each\n'
+          'Value: ${entry.card.price.currency} ${entry.currentValue.toStringAsFixed(2)}\n'
+          '${entry.gainLoss > 0
+              ? 'Profit'
+              : entry.gainLoss < 0
+              ? 'Loss'
+              : 'Break even'}: ${entry.card.price.currency} ${entry.gainLoss.toStringAsFixed(2)}',
         ),
-        trailing: Text('SGD ${entry.currentValue.toStringAsFixed(2)}'),
+        trailing: onEdit == null
+            ? null
+            : IconButton(
+                tooltip: 'Edit purchase',
+                onPressed: onEdit,
+                icon: const Icon(Icons.edit),
+              ),
       ),
     );
   }
